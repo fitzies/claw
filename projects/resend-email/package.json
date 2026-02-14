@@ -1,0 +1,13 @@
+{
+  "name": "pulseflow-email",
+  "version": "1.0.0",
+  "description": "Email automation for Pulseflow users",
+  "main": "send-email.js",
+  "scripts": {
+    "send": "node send-email.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "resend": "^3.0.0"
+  }
+}
