@@ -11,7 +11,7 @@ const config = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
 
 // Load debugging guide for AI context
 const DEBUGGING_GUIDE = fs.readFileSync(
-  path.join(__dirname, '..', '..', 'debugging-for-pulseflow.md'),
+  path.join(__dirname, '..', '..', '..', 'debugging-for-pulseflow.md'),
   'utf8'
 );
 
