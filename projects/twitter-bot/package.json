@@ -1,0 +1,17 @@
+{
+  "name": "claw-twitter-bot",
+  "version": "1.0.0",
+  "description": "Twitter/X API integration for Claw",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "tweet": "node src/tweet.js",
+    "timeline": "node src/timeline.js",
+    "help": "node src/help.js"
+  },
+  "dependencies": {
+    "twitter-api-v2": "^1.15.2",
+    "dotenv": "^16.3.1"
+  }
+}
