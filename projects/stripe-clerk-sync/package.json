@@ -1,0 +1,15 @@
+{
+  "name": "stripe-clerk-sync",
+  "version": "1.0.0",
+  "description": "Sync Stripe subscriptions with Clerk users",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "sync": "node src/index.js",
+    "nonpaying": "node src/nonpaying.js"
+  },
+  "dependencies": {
+    "stripe": "^14.0.0",
+    "@clerk/clerk-sdk-node": "^5.0.0"
+  }
+}
