@@ -1,28 +1,13 @@
 import TelegramBot from 'node-telegram-bot-api';
 import fetch from 'node-fetch';
 import fs from 'fs';
-import path from 'path';
 import { fileURLToPath } from 'url';
-import Stripe from 'stripe';
-import { clerkClient } from '@clerk/clerk-sdk-node';
+import path from 'path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Load config
 const config = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
-
-// Initialize Stripe
-let stripe = null;
-if (config.stripeSecretKey) {
-  stripe = new Stripe(config.stripeSecretKey);
-}
-
-// Initialize Clerk client
-let clerk = null;
-if (config.clerkSecretKey) {
-  process.env.CLERK_SECRET_KEY = config.clerkSecretKey;
-  clerk = clerkClient;
-}
 
 // Initialize bot
 const bot = new TelegramBot(config.telegramBotToken, { polling: true });
@@ -31,8 +16,17 @@ const PULSEFLOW_API = 'https://pulseflow.co/api/automations';
 
 console.log('🤖 Pulseflow Debug Bot started...');
 
-// User sessions for conversational flow
-const userSessions = new Map();
+// Conversation states
+const states = {
+  NONE: 'none',
+  AWAITING_AUTOMATION: 'awaiting_automation',
+  AWAITING_EXPLANATION: 'awaiting_explanation',
+  AWAITING_HELP: 'awaiting_help',
+  AWAITING_RETRY: 'awaiting_retry',
+};
+
+// User sessions
+const sessions = new Map();
 
 // Helper: Fetch automation data
 async function getAutomation(automationId) {
@@ -41,279 +35,307 @@ async function getAutomation(automationId) {
     if (!response.ok) return null;
     return await response.json();
   } catch (error) {
-    console.error('Error fetching automation:', error.message);
+    console.error('Error:', error.message);
     return null;
   }
 }
 
-// Helper: Analyze execution logs - conversational style
-function analyzeExecution(execution, automation) {
-  const logs = execution.logs || [];
-  const failedLog = logs.find(log => log.error !== null);
+// Helper: Analyze and explain issue
+function explainIssue(failedLog, automation) {
+  const errorMessage = failedLog?.error || '';
+  const errorOutput = failedLog?.output || {};
+  const failedNode = automation?.definition?.nodes?.find(n => n.id === failedLog?.nodeId);
   
-  if (!failedLog) {
-    if (execution.status === 'SUCCESS') {
-      return {
-        greeting: "Good news! 🎉",
-        message: `Your automation "${automation.name || 'Unnamed'}" ran successfully!`,
-        details: "Everything looks good with your last run.",
-        footer: "Anything else I can help with?"
-      };
+  const explanations = {
+    network: {
+      emoji: '🌐',
+      title: 'Network hiccup',
+      message: 'There was a temporary network issue. This usually resolves itself in a few minutes.',
+      question: 'Want me to explain more about network errors?'
+    },
+    insufficient_funds: {
+      emoji: '💰',
+      title: 'Not enough balance',
+      message: 'Your wallet doesn\'t have enough PLS to run this automation.',
+      question: 'Do you need help checking your wallet balance?'
+    },
+    slippage: {
+      emoji: '📉',
+      title: 'Price moved too fast',
+      message: 'The price changed between when the trade was planned and when it executed.',
+      question: 'Want me to explain how to adjust slippage settings?'
+    },
+    revert: {
+      emoji: '⚠️',
+      title: 'Transaction rejected',
+      message: 'The blockchain rejected this transaction. Something in the parameters is wrong.',
+      question: 'Should I explain what might be wrong with the configuration?'
+    },
+    variable: {
+      emoji: '🔧',
+      title: 'Missing variable',
+      message: 'A variable is being used but hasn\'t been set yet.',
+      question: 'Do you need help understanding variables?'
+    },
+    previous_output: {
+      emoji: '📊',
+      title: 'Missing data',
+      message: 'The automation is trying to use data from a previous step that doesn\'t exist.',
+      question: 'Want me to explain how nodes pass data to each other?'
+    },
+    foreach: {
+      emoji: '🔄',
+      title: 'For-Each issue',
+      message: 'There\'s something wrong with your For-Each loop setup.',
+      question: 'Do you need help with For-Each configuration?'
+    },
+    success: {
+      emoji: '🎉',
+      title: 'All good!',
+      message: 'Your last run was successful!',
+      question: null
     }
-    return {
-      greeting: "Hmm...",
-      message: "I see the execution exists but I can't see any details about what happened.",
-      details: "This might be a temporary issue. Want me to try again later?",
-      footer: null
-    };
-  }
+  };
   
-  const failedNode = execution.definition?.nodes?.find(n => n.id === failedLog.nodeId);
-  const errorOutput = failedLog.output || {};
-  const errorMessage = failedLog.error || '';
-  
-  // Determine issue type and response
-  let response = { greeting: "Found an issue!", message: "", details: "", footer: "Want me to explain more?" };
-  
+  // Detect issue type
   if (errorMessage.match(/504|502|503|ETIMEDOUT|ECONNREFUSED|rate limit|429/i)) {
-    response.greeting = "Network hiccup! 🌐";
-    response.message = "There was a temporary network issue when your automation tried to run.";
-    response.details = "This is usually just a short delay. Try running it again in a moment.";
-    response.footer = "It should work next time!";
+    return explanations.network;
   }
-  else if (errorMessage.match(/insufficient funds/i)) {
-    response.greeting = "Wallet issue! 💰";
-    response.message = "Your wallet doesn't have enough balance for this transaction.";
-    response.details = "Either add more funds to your wallet, or reduce the amount in your automation.";
-    response.footer = "Your wallet is connected, so you can check and fix this yourself!";
+  if (errorMessage.match(/insufficient funds/i)) {
+    return explanations.insufficient_funds;
   }
-  else if (errorMessage.match(/INSUFFICIENT_OUTPUT_AMOUNT|slippage/i)) {
-    response.greeting = "Slippage issue! 📉";
-    response.message = "The price moved too much between when the trade was planned and executed.";
-    response.details = "Try increasing your slippage tolerance (to 2-3%) or reduce the trade size.";
-    response.footer = "Can adjust this in your swap node settings!";
+  if (errorMessage.match(/INSUFFICIENT_OUTPUT_AMOUNT|slippage/i)) {
+    return explanations.slippage;
   }
-  else if (errorMessage.match(/execution reverted/i)) {
-    response.greeting = "Transaction reverted! ⚠️";
-    response.message = "The blockchain rejected this transaction.";
-    response.details = errorOutput.revertReason 
-      ? `Reason: ${errorOutput.revertReason}`
-      : "Check your parameters - something might be configured wrong.";
-    response.footer = "Review your automation settings and try again!";
+  if (errorMessage.match(/execution reverted|CALL_EXCEPTION/i)) {
+    return explanations.revert;
   }
-  else if (errorMessage.match(/Variable.*not found/i)) {
-    response.greeting = "Missing variable! 🔧";
-    response.message = `Your automation is trying to use a variable called "${errorMessage.match(/Variable '(\w+)'/)?.[1]}" but it hasn't been set yet.`;
-    response.details = "Add a Variable node before the node that's failing to set this value.";
-    response.footer = "Since your wallet is connected, you can add this yourself!";
+  if (errorMessage.match(/Variable.*not found/i)) {
+    return explanations.variable;
   }
-  else if (errorMessage.match(/Previous node output|no previous node output/i)) {
-    response.greeting = "Data missing! 📊";
-    response.message = "The automation is trying to use data from a previous step that doesn't exist or didn't produce output.";
-    response.details = "Make sure you're using this after a node that returns data (like checkBalance).";
-    response.footer = "Adjust the order of your nodes!";
+  if (errorMessage.match(/Previous node output|no previous node output/i)) {
+    return explanations.previous_output;
   }
-  else if (errorMessage.match(/For-Each|forEach/i)) {
-    response.greeting = "For-Each issue! 🔄";
-    response.message = "Something's off with your For-Each loop.";
-    response.details = errorMessage;
-    response.footer = "Since your wallet is connected, check the For-Each configuration yourself!";
-  }
-  else {
-    response.greeting = "Something went wrong! ❌";
-    response.message = errorOutput.userMessage || "An error occurred during execution.";
-    response.details = errorMessage.slice(0, 200);
-    response.footer = null;
+  if (errorMessage.match(/For-Each|forEach/i)) {
+    return explanations.foreach;
   }
   
-  // Add node info
-  if (failedNode) {
-    response.nodeType = failedNode.type;
-    response.nodeNotes = failedNode.data?.notes;
-  }
-  
-  return response;
+  return explanations.success;
 }
 
-// Helper: Generate conversational response
-function generateResponse(automation, executions) {
-  const latestExecution = executions[0];
-  if (!latestExecution) {
-    return {
-      text: "I couldn't find any executions for this automation. Has it been run yet? 🤔",
-      quickReplies: null
-    };
+// Keyboard layouts
+const keyboards = {
+  main: {
+    reply_markup: {
+      keyboard: [
+        [{ text: '🔍 Check my automation' }],
+        [{ text: '❓ What does this mean?' }],
+        [{ text: '🔄 Run my automation' }]
+      ],
+      resize_keyboard: true
+    }
+  },
+  yesNo: {
+    reply_markup: {
+      keyboard: [
+        [{ text: '✅ Yes' }, { text: '❌ No' }]
+      ],
+      resize_keyboard: true
+    }
+  },
+  explanation: {
+    reply_markup: {
+      keyboard: [
+        [{ text: 'Yes, explain more' }],
+        [{ text: 'No, I\'m good' }]
+      ],
+      resize_keyboard: true
+    }
   }
-  
-  const analysis = analyzeExecution(latestExecution, automation);
-  
-  let text = `${analysis.greeting}\n\n`;
-  text += `${analysis.message}\n\n`;
-  
-  if (analysis.details) {
-    text += `${analysis.details}\n\n`;
-  }
-  
-  if (analysis.nodeType) {
-    text += `(Failed at: ${analysis.nodeType} node`;
-    if (analysis.nodeNotes) text += ` — "${analysis.nodeNotes}"`;
-    text += `)\n\n`;
-  }
-  
-  // Execution history
-  text += `📜 *Recent runs*:\n`;
-  executions.slice(0, 5).forEach(ex => {
-    const emoji = ex.status === 'SUCCESS' ? '✅' : ex.status === 'FAILED' ? '❌' : '⏸️';
-    text += `${emoji} ${new Date(ex.startedAt).toLocaleString()}\n`;
-  });
-  
-  if (analysis.footer) {
-    text += `\n${analysis.footer}`;
-  }
-  
-  // Quick replies for follow-up
-  const quickReplies = [
-    { text: "What does this mean?", callback_data: "explain" },
-    { text: "Run again", callback_data: "retry" },
-    { text: "Help me fix it", callback_data: "help" }
-  ];
-  
-  return { text, quickReplies };
-}
+};
 
-// Start message
+// Start command
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-  userSessions.delete(chatId);
+  sessions.set(chatId, { state: states.NONE });
   
-  bot.sendMessage(chatId, 
-    `👋 Hey! I'm your Pulseflow assistant!\n\nI can help you debug automation issues. Just send me your automation ID (or paste a link) and I'll check what's going on.\n\nTry it out!`
+  bot.sendMessage(chatId,
+    `👋 Hey! I'm your Pulseflow assistant!\n\nI can help you debug automation issues and explain what's happening.\n\nWhat would you like to do?`,
+    keyboards.main
   );
 });
 
-// Help command
-bot.onText(/\/help/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    `📖 *How I can help:*\n\n• Send me an automation ID (like \`cmkwhwr4j0001jp0412bdp8zw\`)\n• Or paste a Pulseflow URL\n• I'll analyze your recent runs and explain any issues\n\n*Note:* Since your wallet is connected, I recommend reviewing changes yourself!\n\nAnything else?`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-// Admin: List non-paying users
-bot.onText(/\/nonpaying/, async (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId, 'Checking...');
-  
-  // This would need proper admin auth in production
-  bot.sendMessage(chatId, "Admin features coming soon!");
-});
-
-// Handle automation IDs - conversational
+// Handle main menu options
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text?.trim();
   
-  if (text?.startsWith('/')) return;
+  if (text?.startsWith('/')) return; // Skip commands
   
-  // Check for automation ID
-  const idMatch = text?.match(/([a-z0-9]{20,30})/);
+  const session = sessions.get(chatId) || { state: states.NONE };
   
-  if (idMatch) {
-    const automationId = idMatch[1];
-    
-    bot.sendMessage(chatId, `Let me check that automation... 🔍`);
-    
-    const automation = await getAutomation(automationId);
-    
-    if (!automation) {
-      bot.sendMessage(chatId,
-        `Hmm, I couldn't find an automation with ID \`${automationId}\`\n\nMake sure it exists and you have the right ID! 🤔`,
-        { parse_mode: 'Markdown' }
-      );
-      return;
-    }
-    
-    const executions = (automation.executions || []).slice(0, 10);
-    const { text: responseText, quickReplies } = generateResponse(automation, executions);
-    
-    // Send with inline keyboard for quick replies
-    if (quickReplies) {
-      bot.sendMessage(chatId, responseText, {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            quickReplies.slice(0, 2).map(q => [{ text: q.text, callback_data: q.callback_data }]),
-            quickReplies.slice(2).map(q => [{ text: q.text, callback_data: q.callback_data }])
-          ].filter(row => row.length > 0)
-        }
-      });
+  // Handle automation ID input
+  const idMatch = text?.match(/([a-z0-9]{20,30})/) || text?.includes('pulseflow.co/automations/');
+  
+  if (idMatch || text?.includes('/automations/')) {
+    let automationId;
+    if (text.includes('/automations/')) {
+      const match = text.match(/automations\/([a-z0-9]+)/);
+      automationId = match?.[1];
     } else {
-      bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' });
+      automationId = idMatch[1];
     }
     
-    // Store session
-    userSessions.set(chatId, { automationId, step: 'after_diagnosis' });
-    return;
-  }
-  
-  // Handle URLs
-  if (text?.includes('pulseflow.co/automations/')) {
-    const urlMatch = text.match(/automations\/([a-z0-9]+)/);
-    if (urlMatch) {
-      const automationId = urlMatch[1];
+    if (automationId) {
       bot.sendMessage(chatId, `Checking that automation... 🔍`);
       
       const automation = await getAutomation(automationId);
       
       if (!automation) {
-        bot.sendMessage(chatId, `Couldn't find that automation. Double-check the link? 🤔`);
+        bot.sendMessage(chatId,
+          `Couldn't find that automation. Make sure the ID is correct! 🤔\n\nTry again?`,
+          keyboards.main
+        );
+        sessions.set(chatId, { state: states.NONE });
         return;
       }
       
-      const executions = (automation.executions || []).slice(0, 10);
-      const { text: responseText, quickReplies } = generateResponse(automation, executions);
+      const executions = automation.executions || [];
+      const latestExecution = executions[0];
       
-      if (quickReplies) {
-        bot.sendMessage(chatId, responseText, {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              quickReplies.slice(0, 2).map(q => [{ text: q.text, callback_data: q.callback_data }]),
-              quickReplies.slice(2).map(q => [{ text: q.text, callback_data: q.callback_data }])
-            ].filter(row => row.length > 0)
-          }
-        });
-      } else {
-        bot.sendMessage(chatId, responseText, { parse_mode: 'Markdown' });
+      if (!latestExecution) {
+        bot.sendMessage(chatId,
+          `I found the automation but no executions yet!\n\nHave you run it at least once?`,
+          keyboards.main
+        );
+        sessions.set(chatId, { state: states.NONE });
+        return;
       }
+      
+      const explanation = explainIssue(
+        latestExecution.logs?.find(l => l.error),
+        automation
+      );
+      
+      // Store session with automation
+      sessions.set(chatId, {
+        state: states.AWAITING_EXPLANATION,
+        automationId,
+        automation,
+        execution: latestExecution
+      });
+      
+      bot.sendMessage(chatId,
+        `${explanation.emoji} *${explanation.title}*\n\n${explanation.message}`,
+        { parse_mode: 'Markdown', ...keyboards.explanation }
+      );
     }
+    return;
   }
-});
-
-// Handle callback queries for inline keyboard
-bot.on('callback_query', async (callbackQuery) => {
-  const chatId = callbackQuery.message.chat.id;
-  const data = callbackQuery.data;
   
-  bot.answerCallbackQuery(callbackQuery.id);
-  
-  const session = userSessions.get(chatId);
-  
-  if (data === 'explain') {
+  // Handle "Check my automation"
+  if (text === '🔍 Check my automation') {
+    sessions.set(chatId, { state: states.AWAITING_AUTOMATION });
     bot.sendMessage(chatId,
-      `Here's what happened:\n\nWhen your automation runs, each node executes in sequence. If any node fails, the whole run stops.\n\nI found a failure at a specific node and can explain what went wrong and how to fix it!\n\nWould you like me to walk you through it?`
+      `Send me your automation ID (or paste a Pulseflow link).\n\nI'll check what's going on!`,
+      keyboards.yesNo
     );
+    return;
   }
-  else if (data === 'retry') {
-    bot.sendMessage(chatId,
-      `You can retry by:\n\n1. Opening the automation in Pulseflow\n2. Clicking "Run Now"\n\nOr just wait for the next scheduled run! 🔄`
-    );
+  
+  // Handle "What does this mean?"
+  if (text === '❓ What does this mean?') {
+    if (session.automation) {
+      const explanation = explainIssue(
+        session.execution?.logs?.find(l => l.error),
+        session.automation
+      );
+      
+      sessions.set(chatId, { ...session, state: states.AWAITING_HELP });
+      bot.sendMessage(chatId,
+        `${explanation.message}\n\n${explanation.question || 'Anything else?'}`,
+        keyboards.explanation
+      );
+    } else {
+      bot.sendMessage(chatId,
+        `I'd be happy to explain! First, send me your automation ID so I can give you a specific answer.`,
+        keyboards.main
+      );
+    }
+    return;
   }
-  else if (data === 'help') {
+  
+  // Handle "Run my automation"
+  if (text === '🔄 Run my automation') {
+    sessions.set(chatId, { ...session, state: states.AWAITING_RETRY });
     bot.sendMessage(chatId,
-      `Since your wallet is connected to Pulseflow, you can make changes directly!\n\n*Tips:*\n• Check the failed node's settings\n• Make sure all required fields are filled\n• Verify wallet has enough balance\n\nNeed more specific help? Just ask! 😊`,
-      { parse_mode: 'Markdown' }
+      `To run your automation:\n\n1. Open Pulseflow\n2. Find your automation\n3. Click "Run Now"\n\nWant me to wait while you run it and check again?`,
+      keyboards.yesNo
     );
+    return;
+  }
+  
+  // Handle Yes/No responses based on state
+  if (text === '✅ Yes' || text === '❌ No') {
+    switch (session.state) {
+      case states.AWAITING_AUTOMATION:
+        if (text === '✅ Yes') {
+          bot.sendMessage(chatId,
+            `Great! Send me your automation ID (or paste a link).`,
+            keyboards.yesNo
+          );
+        } else {
+          bot.sendMessage(chatId, `No problem! What else can I help with?`, keyboards.main);
+          sessions.set(chatId, { state: states.NONE });
+        }
+        break;
+        
+      case states.AWAITING_EXPLANATION:
+        if (text === '✅ Yes' && session.explanation) {
+          bot.sendMessage(chatId,
+            `Here's a detailed explanation:\n\n${session.explanation.detailedHelp || session.explanation.message}\n\nAnything else?`,
+            keyboards.main
+          );
+        } else {
+          bot.sendMessage(chatId, `Alright! Anything else I can help with?`, keyboards.main);
+          sessions.set(chatId, { state: states.NONE });
+        }
+        break;
+        
+      case states.AWAITING_HELP:
+        if (text === '✅ Yes') {
+          bot.sendMessage(chatId,
+            `Here's what you can do:\n\nSince your wallet is connected to Pulseflow:\n• Open the automation editor\n• Check the node that failed\n• Fix the configuration\n• Run it again\n\nNeed more specific guidance?`,
+            keyboards.main
+          );
+        } else {
+          bot.sendMessage(chatId, `Got it! Let me know if you need anything else.`, keyboards.main);
+        }
+        sessions.set(chatId, { ...session, state: states.NONE });
+        break;
+        
+      case states.AWAITING_RETRY:
+        if (text === '✅ Yes') {
+          bot.sendMessage(chatId,
+            `Sounds good! Run your automation, then send me the ID again when you're done.\n\nI'll check if it worked! 🎯`,
+            keyboards.main
+          );
+        } else {
+          bot.sendMessage(chatId, `No worries! What else can I help with?`, keyboards.main);
+        }
+        sessions.set(chatId, { state: states.NONE });
+        break;
+        
+      default:
+        bot.sendMessage(chatId, `What would you like to do?`, keyboards.main);
+        sessions.set(chatId, { state: states.NONE });
+    }
+    return;
+  }
+  
+  // Default response
+  if (session.state === states.NONE) {
+    bot.sendMessage(chatId, `What would you like to do?`, keyboards.main);
   }
 });
 
